@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+*.xlsx
+SPEC.md
+AGENTS.md
+.pytest_cache/
