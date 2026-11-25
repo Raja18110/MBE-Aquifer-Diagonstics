@@ -2,6 +2,19 @@
 Engine package for Material Balance Equation (MBE) & Reservoir Diagnostics.
 """
 
+from engine.aquifer import (
+    AQUIFER_CONSTANT_FACTOR,
+    CUFT_PER_BBL,
+    DIFFUSIVITY_CONVERSION_CONSTANT,
+    carter_tracy_aquifer_influx,
+    dimensionless_pressure,
+    dimensionless_pressure_derivative,
+    dimensionless_time,
+    pot_aquifer_influx,
+    pot_aquifer_initial_water,
+    radial_aquifer_constant,
+    schilthuis_aquifer_influx,
+)
 from engine.pvt import (
     BG_CONVERSION_CONSTANT,
     expansion_gas,
@@ -23,6 +36,9 @@ from engine.pvt import (
 
 __all__ = [
     "BG_CONVERSION_CONSTANT",
+    "CUFT_PER_BBL",
+    "DIFFUSIVITY_CONVERSION_CONSTANT",
+    "AQUIFER_CONSTANT_FACTOR",
     "oil_specific_gravity",
     "standing_bubble_point_pressure",
     "standing_solution_gor",
@@ -38,4 +54,12 @@ __all__ = [
     "expansion_gas",
     "expansion_rock_water",
     "generate_pvt_table",
+    "pot_aquifer_initial_water",
+    "pot_aquifer_influx",
+    "schilthuis_aquifer_influx",
+    "radial_aquifer_constant",
+    "dimensionless_time",
+    "dimensionless_pressure",
+    "dimensionless_pressure_derivative",
+    "carter_tracy_aquifer_influx",
 ]
