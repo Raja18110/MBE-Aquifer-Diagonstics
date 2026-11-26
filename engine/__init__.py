@@ -14,6 +14,10 @@ from engine.aquifer import (
     pot_aquifer_initial_water,
     radial_aquifer_constant,
     schilthuis_aquifer_influx,
+    stehfest_invert,
+    stehfest_weights,
+    veh_aquifer_influx,
+    veh_dimensionless_influx,
 )
 from engine.pvt import (
     BG_CONVERSION_CONSTANT,
@@ -62,4 +66,8 @@ __all__ = [
     "dimensionless_pressure",
     "dimensionless_pressure_derivative",
     "carter_tracy_aquifer_influx",
+    "stehfest_weights",
+    "stehfest_invert",
+    "veh_dimensionless_influx",
+    "veh_aquifer_influx",
 ]

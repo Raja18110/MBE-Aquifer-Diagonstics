@@ -1,31 +1,36 @@
 """
 Analytical Aquifer Influx Models for Material Balance Equation (MBE) Diagnostics.
 
-This module implements the first three analytical water influx models in standard
-oilfield units:
+This module implements analytical water influx models in standard oilfield units:
 - Cumulative Water Influx (We): reservoir barrels (rb)
 - Aquifer Water in Place (Wi_aquifer): reservoir barrels (rb)
 - Pressure (P, Pi): psi
 - Time (t): days
 - Geometry (ra, re, h): ft
+- Dimensionless Radius (rD = ra / re): dimensionless
 - Porosity (phi): fraction (0.0 to 1.0)
 - Permeability (k): md
 - Water Viscosity (mu_w): cp
 - Compressibilities (cw, cf, ct): psi^-1
 - Schilthuis Aquifer Constant (C): rb / (day * psi)
-- Carter-Tracy Aquifer Constant (B): rb / psi
+- Unsteady-State Aquifer Constant (B): rb / psi
 - Encroachment Angle (theta): degrees (0 to 360)
 
 Models implemented:
 1. Pot Aquifer Model (small, confined aquifers)
 2. Schilthuis Steady-State Model (trapezoidal integration over time)
 3. Carter-Tracy Unsteady-State Model (non-iterative radial infinite-acting)
+4. Van Everdingen-Hurst (VEH) Unsteady-State Model (Stehfest Laplace inversion + Duhamel superposition)
 """
 
-from typing import Optional, Union
+from fractions import Fraction
+from functools import lru_cache
+import math
+from typing import Any, Callable, Optional, Union
 
 import numpy as np
 import pandas as pd
+from scipy import special
 
 from engine.pvt import _format_return, _vectorize_input
 
@@ -117,6 +122,41 @@ def _prepare_time_pressure_arrays(
         raise ValueError(f"Initial pressure Pi must be finite, got {pi}.")
 
     return t_arr, p_arr, pi_val
+
+
+def _resolve_dimensionless_time(
+    t_arr: np.ndarray,
+    k: Optional[float],
+    phi: Optional[float],
+    mu_w: Optional[float],
+    ct: Optional[float],
+    re: Optional[float],
+    t_d: Optional[Union[list[float], np.ndarray, pd.Series]],
+) -> np.ndarray:
+    """Validate precomputed tD or compute tD from time_days and diffusivity properties."""
+    if t_d is not None:
+        td_arr = np.asarray(t_d, dtype=np.float64)
+        if td_arr.ndim != 1 or td_arr.size != t_arr.size:
+            raise ValueError("t_d must be a 1D array with the same length as time_days and pressures.")
+        if not np.all(np.isfinite(td_arr)) or np.any(td_arr < 0.0):
+            raise ValueError("t_d must contain finite, non-negative values.")
+        if np.any(np.diff(td_arr) < 0.0):
+            raise ValueError("t_d must be monotonically non-decreasing.")
+        return td_arr
+
+    missing = [
+        name
+        for name, val in (("k", k), ("phi", phi), ("mu_w", mu_w), ("ct", ct), ("re", re))
+        if val is None
+    ]
+    if missing:
+        raise ValueError(
+            f"Provide 't_d' or all diffusivity parameters; missing: {missing}."
+        )
+    return np.asarray(
+        dimensionless_time(t_arr, k, phi, mu_w, ct, re),  # type: ignore[arg-type]
+        dtype=np.float64,
+    )
 
 
 def _edwardson_eval(td_pos: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -555,29 +595,7 @@ def carter_tracy_aquifer_influx(
     """
     b_val = _validate_non_negative(b, "Aquifer constant B")
     t_arr, p_arr, pi_val = _prepare_time_pressure_arrays(time_days, pressures, pi)
-
-    if t_d is not None:
-        td_arr = np.asarray(t_d, dtype=np.float64)
-        if td_arr.ndim != 1 or td_arr.size != t_arr.size:
-            raise ValueError("t_d must be a 1D array with the same length as time_days and pressures.")
-        if not np.all(np.isfinite(td_arr)) or np.any(td_arr < 0.0):
-            raise ValueError("t_d must contain finite, non-negative values.")
-        if np.any(np.diff(td_arr) < 0.0):
-            raise ValueError("t_d must be monotonically non-decreasing.")
-    else:
-        missing = [
-            name
-            for name, val in (("k", k), ("phi", phi), ("mu_w", mu_w), ("ct", ct), ("re", re))
-            if val is None
-        ]
-        if missing:
-            raise ValueError(
-                f"Provide 't_d' or all diffusivity parameters; missing: {missing}."
-            )
-        td_arr = np.asarray(
-            dimensionless_time(t_arr, k, phi, mu_w, ct, re),  # type: ignore[arg-type]
-            dtype=np.float64,
-        )
+    td_arr = _resolve_dimensionless_time(t_arr, k, phi, mu_w, ct, re, t_d)
 
     we = np.zeros_like(td_arr, dtype=np.float64)
     if b_val == 0.0:
@@ -599,5 +617,360 @@ def carter_tracy_aquifer_influx(
         denom = pd_vec[n] - td_arr[n - 1] * dpd_vec[n]
         numer = b_val * delta_p[n] - we[n - 1] * dpd_vec[n]
         we[n] = we[n - 1] + (numer / denom) * dt_d
+
+    return we
+
+
+# ============================================================================
+# 4. VAN EVERDINGEN-HURST (VEH) UNSTEADY-STATE MODEL
+# ============================================================================
+_VALID_VEH_GEOMETRIES: tuple[str, ...] = (
+    "radial_infinite",
+    "radial_finite",
+    "linear_infinite",
+)
+
+
+@lru_cache(maxsize=16)
+def _cached_stehfest_weights(n: int) -> tuple[float, ...]:
+    """Compute and cache Stehfest inversion weights V_i via exact rational arithmetic."""
+    half_n = n // 2
+    weights: list[float] = []
+    for i in range(1, n + 1):
+        k_start = (i + 1) // 2
+        k_end = min(i, half_n)
+        acc = Fraction(0)
+        for k in range(k_start, k_end + 1):
+            num = (k ** half_n) * math.factorial(2 * k)
+            den = (
+                math.factorial(half_n - k)
+                * math.factorial(k)
+                * math.factorial(k - 1)
+                * math.factorial(i - k)
+                * math.factorial(2 * k - i)
+            )
+            acc += Fraction(num, den)
+        sign = -1 if (half_n + i) % 2 else 1
+        weights.append(float(sign * acc))
+    return tuple(weights)
+
+
+def stehfest_weights(n: int = 12) -> np.ndarray:
+    """
+    Compute Stehfest numerical Laplace inversion weights V_i.
+
+    Implements Stehfest (1970) Algorithm 368:
+        V_i = (-1)^(N/2 + i) * sum_{k=floor((i+1)/2)}^{min(i, N/2)}
+              k^(N/2) * (2k)! / ((N/2 - k)! * k! * (k - 1)! * (i - k)! * (2k - i)!)
+
+    Parameters
+    ----------
+    n : int, default 12
+        Number of Stehfest series terms (must be a positive even integer).
+
+    Returns
+    -------
+    np.ndarray
+        1D float64 array of Stehfest weights of length ``n`` (dimensionless).
+
+    Raises
+    ------
+    ValueError
+        If ``n`` is not a positive even integer.
+    """
+    if isinstance(n, bool) or not isinstance(n, (int, np.integer)) or int(n) <= 0 or int(n) % 2 != 0:
+        raise ValueError(f"Stehfest order n must be a positive even integer, got {n}.")
+    return np.array(_cached_stehfest_weights(int(n)), dtype=np.float64)
+
+
+def stehfest_invert(
+    laplace_func: Callable[[Any], Any],
+    t: Union[float, list[float], np.ndarray, pd.Series],
+    n: int = 12,
+) -> Union[float, np.ndarray]:
+    """
+    Numerically invert a Laplace-domain function F(s) using the Stehfest algorithm.
+
+    Equation:
+        f(t) ~ (ln(2) / t) * sum_{i=1}^{n} V_i * F(i * ln(2) / t)
+
+    Parameters
+    ----------
+    laplace_func : Callable[[Any], Any]
+        Laplace-domain function F(s) defined for positive real s > 0.
+        Accepts NumPy arrays or scalar floats.
+    t : Union[float, list[float], np.ndarray, pd.Series]
+        Positive time(s) t > 0 at which to evaluate the inverted time-domain function
+        (in consistent units with ``laplace_func``, e.g., days or dimensionless tD).
+    n : int, default 12
+        Number of Stehfest terms (positive even integer).
+
+    Returns
+    -------
+    Union[float, np.ndarray]
+        Inverted time-domain value(s) f(t).
+
+    Raises
+    ------
+    TypeError
+        If ``laplace_func`` is not callable.
+    ValueError
+        If ``n`` is invalid or any ``t`` value is non-finite or <= 0.
+    """
+    if not callable(laplace_func):
+        raise TypeError("laplace_func must be callable.")
+    weights = stehfest_weights(n)
+    t_arr, is_scalar = _vectorize_input(t)
+    if t_arr.size == 0:
+        return _format_return(np.empty_like(t_arr, dtype=np.float64), is_scalar)
+    if np.any(~np.isfinite(t_arr)) or np.any(t_arr <= 0.0):
+        raise ValueError("Time t must be finite and strictly positive (> 0) for Stehfest inversion.")
+
+    ln2_over_t = math.log(2.0) / t_arr
+    i_idx = np.arange(1, weights.size + 1, dtype=np.float64)
+    s_mat = ln2_over_t[..., None] * i_idx
+
+    try:
+        raw = laplace_func(s_mat)
+        f_vals = np.asarray(raw, dtype=np.float64)
+        if f_vals.ndim == 0:
+            f_vals = np.broadcast_to(f_vals, s_mat.shape)
+        elif f_vals.shape != s_mat.shape:
+            raise TypeError("Laplace function output shape does not match input s shape.")
+    except (TypeError, ValueError):
+        flat_vals = [float(laplace_func(float(s_val))) for s_val in s_mat.ravel()]
+        f_vals = np.asarray(flat_vals, dtype=np.float64).reshape(s_mat.shape)
+
+    inverted = ln2_over_t * np.tensordot(f_vals, weights, axes=([-1], [0]))
+    return _format_return(inverted, is_scalar)
+
+
+def _validate_veh_geometry(geometry: str, rD: Optional[float]) -> tuple[str, Optional[float]]:
+    """Validate VEH aquifer geometry keyword and finite outer radius ratio rD = ra / re."""
+    if not isinstance(geometry, str):
+        raise ValueError(f"geometry must be one of {_VALID_VEH_GEOMETRIES}, got {geometry!r}.")
+    geom = geometry.strip().lower()
+    if geom not in _VALID_VEH_GEOMETRIES:
+        raise ValueError(
+            f"Unsupported VEH geometry {geometry!r}. Must be one of {_VALID_VEH_GEOMETRIES}."
+        )
+    if geom == "radial_finite":
+        if rD is None:
+            raise ValueError("Dimensionless radius rD must be provided when geometry='radial_finite'.")
+        rd_val = float(rD)
+        if not np.isfinite(rd_val) or rd_val <= 1.0:
+            raise ValueError(
+                f"Dimensionless radius rD = ra / re must be finite and > 1.0, got {rD}."
+            )
+        return geom, rd_val
+    return geom, None
+
+
+def veh_dimensionless_influx(
+    tD: Union[float, list[float], np.ndarray, pd.Series],
+    geometry: str = "radial_infinite",
+    rD: Optional[float] = None,
+    n: int = 12,
+) -> Union[float, np.ndarray]:
+    """
+    Compute Van Everdingen-Hurst dimensionless water influx WeD(tD).
+
+    Supported aquifer geometries:
+    - ``"radial_infinite"``: Laplace-domain solution
+      ``WeD_bar(s) = K1(sqrt(s)) / (s^(3/2) * K0(sqrt(s)))``, inverted via Stehfest
+      using ``scipy.special.k0e`` and ``scipy.special.k1e`` for numerical stability.
+    - ``"radial_finite"``: No-flow outer boundary at dimensionless radius ``rD = ra / re > 1``,
+      inverted via Stehfest using exponentially scaled Bessel functions
+      (``i0e``, ``i1e``, ``k0e``, ``k1e``). Converges to ``(rD^2 - 1) / 2`` as ``tD -> inf``.
+    - ``"linear_infinite"``: Exact analytical solution ``WeD(tD) = (2 / sqrt(pi)) * sqrt(tD)``.
+
+    At ``tD = 0``, returns ``WeD = 0.0`` for all geometries.
+
+    Parameters
+    ----------
+    tD : Union[float, list[float], np.ndarray, pd.Series]
+        Dimensionless time tD (>= 0, dimensionless).
+    geometry : str, default "radial_infinite"
+        Aquifer geometry: ``"radial_infinite"``, ``"radial_finite"``, or ``"linear_infinite"``.
+    rD : Optional[float], optional
+        Dimensionless outer aquifer radius ``ra / re`` (> 1.0), required when
+        ``geometry="radial_finite"``.
+    n : int, default 12
+        Stehfest Laplace inversion order (positive even integer).
+
+    Returns
+    -------
+    Union[float, np.ndarray]
+        Dimensionless cumulative water influx WeD (dimensionless).
+
+    Raises
+    ------
+    ValueError
+        If ``tD`` is negative/non-finite, ``geometry`` is unsupported, ``rD`` is invalid
+        for ``"radial_finite"``, or ``n`` is invalid.
+    """
+    geom, rd_val = _validate_veh_geometry(geometry, rD)
+    stehfest_weights(n)
+
+    td_arr, is_scalar = _vectorize_input(tD)
+    if np.any(~np.isfinite(td_arr)) or np.any(td_arr < 0.0):
+        raise ValueError("Dimensionless time tD must be finite and non-negative (>= 0).")
+
+    wed = np.zeros_like(td_arr, dtype=np.float64)
+    pos_mask = td_arr > 0.0
+    if not np.any(pos_mask):
+        return _format_return(wed, is_scalar)
+
+    td_pos = td_arr[pos_mask]
+    if geom == "linear_infinite":
+        wed[pos_mask] = (2.0 / math.sqrt(math.pi)) * np.sqrt(td_pos)
+        return _format_return(wed, is_scalar)
+
+    if geom == "radial_infinite":
+
+        def _laplace_radial_infinite(s: np.ndarray) -> np.ndarray:
+            u = np.sqrt(s)
+            return special.k1e(u) / (s * (u * special.k0e(u)))
+
+        wed[pos_mask] = np.asarray(
+            stehfest_invert(_laplace_radial_infinite, td_pos, n=n),
+            dtype=np.float64,
+        )
+        return _format_return(wed, is_scalar)
+
+    assert rd_val is not None
+
+    def _laplace_radial_finite(s: np.ndarray) -> np.ndarray:
+        u = np.sqrt(s)
+        alpha = np.exp(-2.0 * (rd_val - 1.0) * u)
+        i1_ru = special.i1e(rd_val * u)
+        k1_ru = special.k1e(rd_val * u)
+        i0_u = special.i0e(u)
+        i1_u = special.i1e(u)
+        k0_u = special.k0e(u)
+        k1_u = special.k1e(u)
+        num = i1_ru * k1_u - alpha * k1_ru * i1_u
+        den = s * (u * (k0_u * i1_ru + alpha * i0_u * k1_ru))
+        return num / den
+
+    wed[pos_mask] = np.asarray(
+        stehfest_invert(_laplace_radial_finite, td_pos, n=n),
+        dtype=np.float64,
+    )
+    return _format_return(wed, is_scalar)
+
+
+def veh_aquifer_influx(
+    time_days: Union[list[float], np.ndarray, pd.Series],
+    pressures: Union[list[float], np.ndarray, pd.Series],
+    b: float,
+    pi: Optional[float] = None,
+    k: Optional[float] = None,
+    phi: Optional[float] = None,
+    mu_w: Optional[float] = None,
+    ct: Optional[float] = None,
+    re: Optional[float] = None,
+    t_d: Optional[Union[list[float], np.ndarray, pd.Series]] = None,
+    geometry: str = "radial_infinite",
+    rD: Optional[float] = None,
+    ra: Optional[float] = None,
+    n: int = 12,
+) -> np.ndarray:
+    """
+    Calculate cumulative water influx (We) using the Van Everdingen-Hurst (VEH) model in rb.
+
+    Evaluates full Duhamel superposition across arbitrary time (days) and pressure (psi)
+    histories using standard midpoint pressure drops:
+        dP_0 = (Pi - P_1) / 2               (when P_0 == Pi; Pi - (P_0 + P_1) / 2 generally)
+        dP_j = (P_{j-1} - P_{j+1}) / 2      for j >= 1
+        We(t_n) = B * sum_{j=0}^{n-1} dP_j * WeD(tD_n - tD_j)
+
+    Either provide precomputed dimensionless times ``t_d`` directly, or provide
+    all five aquifer diffusivity properties (``k``, ``phi``, ``mu_w``, ``ct``, ``re``)
+    to compute ``t_d`` from ``time_days`` (for ``linear_infinite``, pass characteristic
+    aquifer length as ``re`` if deriving ``t_d``).
+
+    Parameters
+    ----------
+    time_days : Union[list[float], np.ndarray, pd.Series]
+        Elapsed production/depletion times in days (non-negative, non-decreasing).
+    pressures : Union[list[float], np.ndarray, pd.Series]
+        Reservoir boundary pressures corresponding to ``time_days`` in psi.
+    b : float
+        Aquifer water influx constant B in rb/psi (>= 0).
+    pi : Optional[float], optional
+        Initial reservoir pressure in psi. Defaults to ``pressures[0]``.
+    k : Optional[float], optional
+        Aquifer permeability in md (required if ``t_d`` is None).
+    phi : Optional[float], optional
+        Aquifer porosity fraction (required if ``t_d`` is None).
+    mu_w : Optional[float], optional
+        Aquifer water viscosity in cp (required if ``t_d`` is None).
+    ct : Optional[float], optional
+        Total aquifer compressibility (cw + cf) in psi^-1 (required if ``t_d`` is None).
+    re : Optional[float], optional
+        Reservoir outer radius (or characteristic length for linear flow) in ft
+        (required if ``t_d`` is None).
+    t_d : Optional[Union[list[float], np.ndarray, pd.Series]], optional
+        Precomputed dimensionless time array matching ``time_days`` (dimensionless).
+    geometry : str, default "radial_infinite"
+        Aquifer geometry: ``"radial_infinite"``, ``"radial_finite"``, or ``"linear_infinite"``.
+    rD : Optional[float], optional
+        Dimensionless outer radius ``ra / re`` (> 1.0) for ``geometry="radial_finite"``.
+    ra : Optional[float], optional
+        Aquifer outer radius in ft. Used to compute ``rD = ra / re`` if ``rD`` is None
+        and ``re`` is provided for ``geometry="radial_finite"``.
+    n : int, default 12
+        Stehfest Laplace inversion order (positive even integer).
+
+    Returns
+    -------
+    np.ndarray
+        Cumulative water influx We at each time step in reservoir barrels (rb).
+
+    Raises
+    ------
+    ValueError
+        If inputs are invalid, mismatched, geometry/rD are invalid, or diffusivity
+        parameters are missing when ``t_d`` is None.
+    """
+    if rD is None and ra is not None and re is not None:
+        ra_val = _validate_positive(ra, "Aquifer radius ra")
+        re_val = _validate_positive(re, "Reservoir radius re")
+        rD = ra_val / re_val
+
+    geom, rd_val = _validate_veh_geometry(geometry, rD)
+    stehfest_weights(n)
+    b_val = _validate_non_negative(b, "Aquifer constant B")
+    t_arr, p_arr, pi_val = _prepare_time_pressure_arrays(time_days, pressures, pi)
+    td_arr = _resolve_dimensionless_time(t_arr, k, phi, mu_w, ct, re, t_d)
+
+    m_steps = t_arr.size
+    we = np.zeros(m_steps, dtype=np.float64)
+    if b_val == 0.0 or m_steps <= 1:
+        return we
+
+    dp = np.empty(m_steps - 1, dtype=np.float64)
+    if p_arr[0] == pi_val:
+        dp[0] = 0.5 * (pi_val - p_arr[1])
+    else:
+        dp[0] = pi_val - 0.5 * (p_arr[0] + p_arr[1])
+    if m_steps > 2:
+        dp[1:] = 0.5 * (p_arr[:-2] - p_arr[2:])
+
+    # Evaluate lower-triangular superposition in row chunks to bound memory for long histories.
+    chunk_size = 512
+    for start in range(1, m_steps, chunk_size):
+        stop = min(m_steps, start + chunk_size)
+        n_vec = np.arange(start, stop)
+        j_vec = np.arange(stop - 1)
+        mask = j_vec[None, :] < n_vec[:, None]
+        dt_d = td_arr[n_vec[:, None]] - td_arr[j_vec[None, :]]
+
+        wed_block = np.zeros(mask.shape, dtype=np.float64)
+        wed_block[mask] = veh_dimensionless_influx(
+            dt_d[mask], geometry=geom, rD=rd_val, n=n
+        )
+        we[start:stop] = b_val * (wed_block @ dp[: stop - 1])
 
     return we
