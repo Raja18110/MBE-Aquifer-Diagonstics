@@ -19,6 +19,14 @@ from engine.aquifer import (
     veh_aquifer_influx,
     veh_dimensionless_influx,
 )
+from engine.mbe import (
+    MBEResult,
+    calculate_drive_indices,
+    calculate_total_expansion,
+    calculate_underground_withdrawal,
+    compute_diagnostic_tables,
+    fit_mbe_model,
+)
 from engine.pvt import (
     BG_CONVERSION_CONSTANT,
     expansion_gas,
@@ -70,4 +78,10 @@ __all__ = [
     "stehfest_invert",
     "veh_dimensionless_influx",
     "veh_aquifer_influx",
+    "MBEResult",
+    "calculate_underground_withdrawal",
+    "calculate_total_expansion",
+    "compute_diagnostic_tables",
+    "calculate_drive_indices",
+    "fit_mbe_model",
 ]
